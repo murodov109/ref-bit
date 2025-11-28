@@ -1,7 +1,8 @@
 import os
 import sqlite3
+import time
 from datetime import datetime
-from ayugram import Client, filters
+from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 API_ID = int(os.getenv("API_ID"))
@@ -11,6 +12,7 @@ ADMINS = set(int(x) for x in os.getenv("ADMINS","").split(",") if x.strip())
 
 app = Client("kino_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
+# DB
 conn = sqlite3.connect("bot.db", check_same_thread=False)
 cur = conn.cursor()
 cur.execute("CREATE TABLE IF NOT EXISTS admins(id INTEGER PRIMARY KEY)")
@@ -31,7 +33,7 @@ cur.execute("""CREATE TABLE IF NOT EXISTS movies(
 )""")
 conn.commit()
 for a in ADMINS:
-    cur.execute("INSERT OR IGNORE INTO admins(id) VALUES(?)", (a,))
+    cur.execute("INSERT OR IGNORE INTO admins(id) VALUES(?)",(a,))
 conn.commit()
 
 states = {}
