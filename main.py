@@ -1,383 +1,242 @@
 import os
 import sqlite3
 from dotenv import load_dotenv
-from telebot import TeleBot, types
-
+from pyrogram import Client, filters
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 load_dotenv()
-TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS","").split(",") if x.strip()]
-CHANNEL_ID = os.getenv("ANNOUNCE_CHANNEL_ID","")
-BOT_USERNAME = os.getenv("BOT_USERNAME","your_bot_username")
 
-bot = TeleBot(TOKEN, parse_mode="HTML")
+API_ID = int(os.getenv("API_ID", "0"))
+API_HASH = os.getenv("API_HASH", "")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+ADMINS = set(int(x) for x in os.getenv("ADMINS","").split(",") if x.strip())
+
 conn = sqlite3.connect("bot.db", check_same_thread=False)
 cur = conn.cursor()
-cur.execute("CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, username TEXT, balance INTEGER DEFAULT 0, referrals INTEGER DEFAULT 0, ref_by INTEGER DEFAULT 0, ref_counted INTEGER DEFAULT 0, active INTEGER DEFAULT 1, joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
-cur.execute("CREATE TABLE IF NOT EXISTS withdraws(id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, amount INTEGER, dest TEXT, status TEXT DEFAULT 'pending', created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
-cur.execute("CREATE TABLE IF NOT EXISTS forced_channels(id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id TEXT)")
-cur.execute("CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT)")
+cur.execute("CREATE TABLE IF NOT EXISTS channels(id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE, required INTEGER, active INTEGER)")
+cur.execute("CREATE TABLE IF NOT EXISTS links(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT, url TEXT)")
+cur.execute("CREATE TABLE IF NOT EXISTS admins(id INTEGER PRIMARY KEY)")
+cur.execute("CREATE TABLE IF NOT EXISTS movies(id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT UNIQUE, title TEXT, file_id TEXT, size_bytes INTEGER, size_text TEXT, duration_seconds INTEGER, duration_text TEXT, uploaded_by INTEGER, uploaded_at TEXT)")
 conn.commit()
 
-def get_setting(key, default):
-    r = cur.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
-    if r:
-        try:
-            return int(r[0])
-        except:
-            return r[0]
-    cur.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (key, str(default)))
-    conn.commit()
-    return default
+for a in ADMINS:
+    cur.execute("INSERT OR IGNORE INTO admins(id) VALUES(?)",(a,))
+conn.commit()
 
-REF_BONUS = get_setting("ref_bonus", 100)
-MIN_WITHDRAW = get_setting("min_withdraw", 10000)
+admin_state = {}
 
-def set_setting(key, value):
-    cur.execute("INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)", (key, str(value)))
-    conn.commit()
-    global REF_BONUS, MIN_WITHDRAW
-    REF_BONUS = get_setting("ref_bonus", 100)
-    MIN_WITHDRAW = get_setting("min_withdraw", 10000)
+def mk_admin_panel():
+    kb = [
+        [InlineKeyboardButton("📁 Filmlar", callback_data="admin_movies")],
+        [InlineKeyboardButton("📡 Kanallar", callback_data="admin_channels"), InlineKeyboardButton("🔗 Havolalar", callback_data="admin_links")],
+        [InlineKeyboardButton("👥 Adminlar", callback_data="admin_admins"), InlineKeyboardButton("📊 Statistika", callback_data="admin_stats")],
+        [InlineKeyboardButton("⚙️ Sozlamalar", callback_data="admin_settings")]
+    ]
+    return InlineKeyboardMarkup(kb)
 
-def get_user(uid):
-    r = cur.execute("SELECT id,username,balance,referrals,ref_by,ref_counted FROM users WHERE id=?", (uid,)).fetchone()
-    return r
+def mk_start_markup(user_id):
+    rows = []
+    cur.execute("SELECT username FROM channels WHERE active=1")
+    for r in cur.fetchall():
+        rows.append([InlineKeyboardButton(r[0], url=f"https://t.me/{r[0].lstrip('@')}")])
+    cur.execute("SELECT name,url FROM links")
+    links = cur.fetchall()
+    if links:
+        rows.append([InlineKeyboardButton("🔗 Qoʻshimcha havolalar", callback_data="show_links")])
+    rows.append([InlineKeyboardButton("✅ Obunani tekshirish", callback_data="check_subs")])
+    return InlineKeyboardMarkup(rows)
 
-def ensure_user(uid, username, ref_by=0):
-    if not cur.execute("SELECT 1 FROM users WHERE id=?", (uid,)).fetchone():
-        cur.execute("INSERT INTO users(id,username,balance,ref_by,ref_counted) VALUES(?,?,?,?,?)", (uid, username or "", 0, ref_by or 0, 0))
-        conn.commit()
-    else:
-        cur.execute("UPDATE users SET username=? WHERE id=?", (username or "", uid))
-        conn.commit()
-    if ref_by:
-        credited = cur.execute("SELECT ref_counted FROM users WHERE id=?", (uid,)).fetchone()[0]
-        if not credited:
-            ok, _ = check_forced_subscription(uid)
-            if ok:
-                credit_referral(ref_by, uid)
+def fmt_size(n):
+    mb = n/1024/1024
+    if mb<1024:
+        return f"{mb:.0f} MB"
+    return f"{mb/1024:.2f} GB"
 
-def credit_referral(ref_by, new_user_id):
-    if not ref_by:
-        return
-    if not cur.execute("SELECT 1 FROM users WHERE id=?", (ref_by,)).fetchone():
-        return
-    cur.execute("UPDATE users SET referrals = referrals + 1 WHERE id=?", (ref_by,))
-    cur.execute("UPDATE users SET balance = balance + ? WHERE id=?", (REF_BONUS, ref_by))
-    cur.execute("UPDATE users SET ref_counted=1 WHERE id=?", (new_user_id,))
-    conn.commit()
-    try:
-        bot.send_message(ref_by, f"Taklifingiz tasdiqlandi va sizga {REF_BONUS} so'm berildi")
-    except:
-        pass
+from datetime import datetime
+app = Client("kino_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-def make_reply_kb():
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row("👤 Hisobim", "💰 Pul ishlash")
-    kb.row("🏦 Pul yechish", "📤 Pul yechish so'rovlari")
-    kb.row("📩 Admin bilan aloqa", "📜 Isbotlar")
-    return kb
-
-def check_forced_subscription(uid):
-    rows = cur.execute("SELECT chat_id FROM forced_channels").fetchall()
-    for r in rows:
-        chat = r[0]
-        try:
-            member = bot.get_chat_member(chat, uid)
-            if member.status in ["left","kicked"]:
-                return False, chat
-        except:
-            return False, chat
-    return True, None
-
-def mask_sensitive(s):
-    st = str(s)
-    if len(st) <= 6:
-        return st[:1] + "*"*(max(0,len(st)-2)) + st[-1:]
-    keep_start = 4
-    keep_end = 2
-    return st[:keep_start] + "*"*(len(st)-keep_start-keep_end) + st[-keep_end:]
-
-@bot.message_handler(commands=["start"])
-def start(m):
-    args = m.text.split()
-    ref_by = 0
-    if len(args) > 1 and args[1].startswith("ref"):
-        try:
-            ref_by = int(args[1].split("_")[1])
-        except:
-            ref_by = 0
-    ensure_user(m.from_user.id, m.from_user.username, ref_by)
-    ok, need = check_forced_subscription(m.from_user.id)
-    name = m.from_user.first_name or m.from_user.username or "Foydalanuvchi"
-    greeting = f"Salom {name}! Botga xush kelibsiz"
-    if not ok:
-        greeting += f"\nIltimos kanalga obuna bo'ling: {need}"
-    bot.send_message(m.chat.id, greeting, reply_markup=make_reply_kb())
-
-@bot.message_handler(func=lambda m: m.text == "👤 Hisobim")
-def my_account(m):
+@app.on_message(filters.private & filters.command("start"))
+async def start(c, m):
     uid = m.from_user.id
-    ensure_user(uid, m.from_user.username)
-    u = get_user(uid)
-    bal = u[2] if u else 0
-    refcount = u[3] if u else 0
-    ref_link = f"https://t.me/{BOT_USERNAME}?start=ref_{uid}"
-    ok, need = check_forced_subscription(uid)
-    if not ok:
-        bot.send_message(uid, f"Iltimos quyidagi kanalga a'zo bo'ling: {need}")
+    if cur.execute("SELECT 1 FROM admins WHERE id=?",(uid,)).fetchone():
+        await m.reply("Admin panelga xush kelibsiz", reply_markup=mk_admin_panel())
         return
-    cur.execute("SELECT ref_by FROM users WHERE id=?", (uid,))
-    ref_by = cur.fetchone()[0] if cur.fetchone() is not None else None
-    pending = ""
-    if ref_by and not u[5]:
-        credit_referral(ref_by, uid)
-        pending = "\nSizning referal holating tekshirildi"
-    text = f"Hisobingiz: {bal} so'm\nTakliflar: {refcount}\nSizning referal havolangiz:\n{ref_link}{pending}"
-    bot.send_message(uid, text)
+    text = f"🎬 Assalomu alaykum, {m.from_user.first_name}!\nKinolarni olish uchun pastdagi kanallarga obuna bo'ling."
+    await m.reply(text, reply_markup=mk_start_markup(uid))
 
-@bot.message_handler(func=lambda m: m.text == "💰 Pul ishlash")
-def earn(m):
-    uid = m.from_user.id
-    ensure_user(uid, m.from_user.username)
-    ok, need = check_forced_subscription(uid)
-    if not ok:
-        bot.send_message(uid, f"Iltimos majburiy kanalga a'zo bo'ling: {need}")
-        return
-    ref_link = f"https://t.me/{BOT_USERNAME}?start=ref_{uid}"
-    text = f"Hamkorlik orqali pul ishlang. Har bir yangi foydalanuvchi uchun bonus: {REF_BONUS} so'm\nSizning havolangiz:\n{ref_link}"
-    bot.send_message(uid, text)
-
-@bot.message_handler(func=lambda m: m.text == "🏦 Pul yechish")
-def withdraw_menu(m):
-    uid = m.from_user.id
-    bot.send_message(uid, f"Iltimos yechmoqchi bo'lgan summangizni yuboring. Minimal: {MIN_WITHDRAW}")
-
-@bot.message_handler(func=lambda m: m.text == "📤 Pul yechish so'rovlari")
-def my_withdraws(m):
-    uid = m.from_user.id
-    rows = cur.execute("SELECT id,amount,status,created_at FROM withdraws WHERE user_id=? ORDER BY created_at DESC", (uid,)).fetchall()
-    if not rows:
-        bot.send_message(uid, "Yuborilgan so'rovlar topilmadi")
-        return
-    txt = "Sizning so'rovlari:\n"
-    for r in rows:
-        txt += f"ID:{r[0]} Summa:{r[1]} Holat:{r[2]} Vaqt:{r[3]}\n"
-    bot.send_message(uid, txt)
-
-@bot.message_handler(func=lambda m: m.text == "📩 Admin bilan aloqa")
-def contact_admin_btn(m):
-    uid = m.from_user.id
-    bot.send_message(uid, "Xabar matnini yuboring, adminga to'g'ridan-to'g'ri yuboraman")
-    bot.register_next_step_handler_by_chat_id(uid, forward_to_admin)
-
-@bot.message_handler(func=lambda m: m.text == "📜 Isbotlar")
-def proofs_btn(m):
-    url = os.getenv("PROOFS_URL","https://t.me/your_proof_channel")
-    bot.send_message(m.from_user.id, "Isbotlar uchun kanal: " + url)
-
-@bot.message_handler(func=lambda m: m.chat.type=="private", content_types=["text"])
-def handle_text(m):
-    uid = m.from_user.id
-    text = m.text.strip()
-    if text.isdigit():
-        amt = int(text)
-        if amt >= MIN_WITHDRAW:
-            u = get_user(uid)
-            bal = u[2] if u else 0
-            if bal < amt:
-                bot.send_message(uid, "Hisobingizda yetarli mablag' yo'q")
-                return
-            bot.send_message(uid, "Iltimos kartangiz yoki telefon raqamingizni yuboring")
-            bot.register_next_step_handler_by_chat_id(uid, lambda msg, a=amt: receive_withdraw_dest(msg, a))
-            return
-    if uid in ADMIN_IDS and text.startswith("/admin"):
-        kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-        kb.row("📊 Statistika", "🔧 Sozlamalar")
-        kb.row("📥 Pul yechish so'rovlari", "📣 Reklama yuborish")
-        kb.row("➕ Kanal qo'shish", "➖ Kanal o'chirish")
-        kb.row("➕ Balans qo'shish", "⬅️ Orqaga")
-        bot.send_message(uid, "Admin panel", reply_markup=kb)
-        return
-    if text == "🔧 Sozlamalar" and uid in ADMIN_IDS:
-        kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-        kb.row(f"💱 Referal bonusi: {REF_BONUS}", f"💸 Minimal yechish: {MIN_WITHDRAW}")
-        kb.row("⬅️ Orqaga")
-        bot.send_message(uid, "Sozlamalarni tanlang", reply_markup=kb)
-        return
-    if text.startswith("💱 Referal bonusi") and uid in ADMIN_IDS:
-        bot.send_message(uid, "Yangi referal bonusini summada yuboring")
-        bot.register_next_step_handler_by_chat_id(uid, set_ref_bonus)
-        return
-    if text.startswith("💸 Minimal yechish") and uid in ADMIN_IDS:
-        bot.send_message(uid, "Yangi minimal yechish summasini yuboring")
-        bot.register_next_step_handler_by_chat_id(uid, set_min_withdraw)
-        return
-    if text == "📊 Statistika" and uid in ADMIN_IDS:
-        total = cur.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        active = cur.execute("SELECT COUNT(*) FROM users WHERE active=1").fetchone()[0]
-        today_new = cur.execute("SELECT COUNT(*) FROM users WHERE date(joined_at)=date('now')").fetchone()[0]
-        total_refs = cur.execute("SELECT SUM(referrals) FROM users").fetchone()[0] or 0
-        txt = f"Umumiy foydalanuvchilar: {total}\nAktiv: {active}\nBugungi yangi: {today_new}\nUmumiy takliflar: {total_refs}"
-        bot.send_message(uid, txt)
-        return
-    if text == "📥 Pul yechish so'rovlari" and uid in ADMIN_IDS:
-        rows = cur.execute("SELECT id,user_id,amount,dest,status,created_at FROM withdraws ORDER BY created_at DESC").fetchall()
-        txt = ""
+@app.on_callback_query()
+async def cb(c, q):
+    uid = q.from_user.id
+    data = q.data
+    if data == "check_subs":
+        cur.execute("SELECT username FROM channels WHERE active=1 AND required=1")
+        rows = cur.fetchall()
+        missing=[]
         for r in rows:
-            txt += f"ID:{r[0]} User:{r[1]} Sum:{r[2]} Manzil:{mask_sensitive(r[3])} Holat:{r[4]}\n"
-            kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-        bot.send_message(uid, "Hamma so'rovlar:\n" + txt)
-        return
-    if text == "➕ Kanal qo'shish" and uid in ADMIN_IDS:
-        bot.send_message(uid, "Kanal usernameni yoki id ni yuboring")
-        bot.register_next_step_handler_by_chat_id(uid, add_channel)
-        return
-    if text == "➖ Kanal o'chirish" and uid in ADMIN_IDS:
-        bot.send_message(uid, "O'chirmoqchi bo'lgan kanal usernameni yoki id ni yuboring")
-        bot.register_next_step_handler_by_chat_id(uid, remove_channel)
-        return
-    if text == "➕ Balans qo'shish" and uid in ADMIN_IDS:
-        bot.send_message(uid, "Foydalanuvchi id va summa: user_id summa")
-        bot.register_next_step_handler_by_chat_id(uid, admin_add_balance)
-        return
-    if text == "📣 Reklama yuborish" and uid in ADMIN_IDS:
-        bot.send_message(uid, "Reklama matnini yuboring")
-        bot.register_next_step_handler_by_chat_id(uid, admin_broadcast)
-        return
-    if text == "⬅️ Orqaga":
-        bot.send_message(uid, "Asosiy menyu", reply_markup=make_reply_kb())
-        return
-    bot.send_message(uid, "Asosiy menyu", reply_markup=make_reply_kb())
+            try:
+                status = await app.get_chat_member(r[0], uid)
+                if status.status in ("member","creator","administrator"):
+                    continue
+            except:
+                missing.append(r[0])
+        if missing:
+            txt = "Quyidagi kanallarga obuna bo'lishingiz kerak:\n" + "\n".join(missing)
+            await q.answer()
+            await q.message.edit(txt, reply_markup=mk_start_markup(uid))
+        else:
+            await q.answer("Obuna tekshirildi")
+            await q.message.edit("Siz barcha majburiy kanallarga obuna bo'lgansiz. Endi kod yuboring.", reply_markup=None)
+    elif data == "show_links":
+        cur.execute("SELECT name,url FROM links")
+        rows = cur.fetchall()
+        txt = "🔗 Qoʻshimcha havolalar:\n" + "\n".join(f"{r[0]} — {r[1]}" for r in rows) if rows else "Havolalar mavjud emas"
+        await q.answer()
+        await q.message.reply(txt)
+    elif data.startswith("admin_") and cur.execute("SELECT 1 FROM admins WHERE id=?",(uid,)).fetchone():
+        key = data.split("_",1)[1]
+        if key=="movies":
+            kb = [[InlineKeyboardButton("➕ Yangi film", callback_data="add_movie")],[InlineKeyboardButton("📜 Filmlar ro'yxati", callback_data="list_movies")]]
+            await q.message.edit("Filmlar boshqaruvi", reply_markup=InlineKeyboardMarkup(kb))
+        elif key=="channels":
+            kb = [[InlineKeyboardButton("➕ Kanal qo'shish", callback_data="add_channel")],[InlineKeyboardButton("📜 Kanallar ro'yxati", callback_data="list_channels")]]
+            await q.message.edit("Kanallar boshqaruvi", reply_markup=InlineKeyboardMarkup(kb))
+        elif key=="links":
+            kb = [[InlineKeyboardButton("➕ Havola qo'shish", callback_data="add_link")],[InlineKeyboardButton("📜 Havolalar ro'yxati", callback_data="list_links")]]
+            await q.message.edit("Havolalar boshqaruvi", reply_markup=InlineKeyboardMarkup(kb))
+        elif key=="admins":
+            kb = [[InlineKeyboardButton("➕ Admin qo'shish", callback_data="add_admin")],[InlineKeyboardButton("📜 Adminlar ro'yxati", callback_data="list_admins")]]
+            await q.message.edit("Adminlar boshqaruvi", reply_markup=InlineKeyboardMarkup(kb))
+        elif key=="stats":
+            users = await app.get_me()
+            await q.answer()
+            await q.message.reply("Statistika paneli")
+        elif key=="settings":
+            await q.message.edit("Sozlamalar", reply_markup=mk_admin_panel())
+    elif data == "add_movie" and cur.execute("SELECT 1 FROM admins WHERE id=?",(uid,)).fetchone():
+        admin_state[uid] = {"step":"code"}
+        await q.message.reply("1) Kinoga beriladigan kodni yuboring")
+    elif data == "list_movies" and cur.execute("SELECT 1 FROM admins WHERE id=?",(uid,)).fetchone():
+        cur.execute("SELECT code,title FROM movies ORDER BY id DESC")
+        rows = cur.fetchall()
+        txt = "\n".join(f"{r[0]} — {r[1]}" for r in rows) if rows else "Film yo'q"
+        await q.message.reply(txt)
+    elif data == "add_channel" and cur.execute("SELECT 1 FROM admins WHERE id=?",(uid,)).fetchone():
+        admin_state[uid] = {"step":"channel_username"}
+        await q.message.reply("Kanal username (@username) kiriting")
+    elif data == "list_channels" and cur.execute("SELECT 1 FROM admins WHERE id=?",(uid,)).fetchone():
+        cur.execute("SELECT username,required,active FROM channels")
+        rows = cur.fetchall()
+        txt = "\n".join(f"{r[0]} — required={r[1]} active={r[2]}" for r in rows) if rows else "Kanal yo'q"
+        await q.message.reply(txt)
+    elif data == "add_link" and cur.execute("SELECT 1 FROM admins WHERE id=?",(uid,)).fetchone():
+        admin_state[uid] = {"step":"link_name"}
+        await q.message.reply("Havola nomini kiriting (masalan: Instagram)")
+    elif data == "list_links" and cur.execute("SELECT 1 FROM admins WHERE id=?",(uid,)).fetchone():
+        cur.execute("SELECT name,url FROM links")
+        rows = cur.fetchall()
+        txt = "\n".join(f"{r[0]} — {r[1]}" for r in rows) if rows else "Havola yo'q"
+        await q.message.reply(txt)
+    elif data == "add_admin" and cur.execute("SELECT 1 FROM admins WHERE id=?",(uid,)).fetchone():
+        admin_state[uid] = {"step":"new_admin"}
+        await q.message.reply("Qo'shmoqchi bo'lgan adminning Telegram ID sini yuboring")
+    elif data == "list_admins" and cur.execute("SELECT 1 FROM admins WHERE id=?",(uid,)).fetchone():
+        cur.execute("SELECT id FROM admins")
+        rows = cur.fetchall()
+        txt = "\n".join(str(r[0]) for r in rows)
+        await q.message.reply(txt)
+    elif data.startswith("download_"):
+        mid = int(data.split("_",1)[1])
+        cur.execute("SELECT file_id FROM movies WHERE id=?", (mid,))
+        r = cur.fetchone()
+        if r:
+            await q.message.reply_video(r[0])
+        await q.answer()
 
-def set_ref_bonus(m):
+@app.on_message(filters.private & filters.text & ~filters.command)
+async def text_handler(c, m):
     uid = m.from_user.id
-    try:
-        v = int(m.text.strip())
-        set_setting("ref_bonus", v)
-        bot.send_message(uid, f"Referal bonusi o'zgartirildi: {v}")
-    except:
-        bot.send_message(uid, "Iltimos son kiriting")
+    txt = m.text.strip()
+    if uid in admin_state:
+        s = admin_state[uid]
+        if s["step"]=="code":
+            s["code"]=txt
+            s["step"]="title"
+            await m.reply("2) Kino nomini yuboring")
+            return
+        if s["step"]=="title":
+            s["title"]=txt
+            s["step"]="video"
+            await m.reply("3) Endi video faylini yuboring")
+            return
+        if s["step"]=="channel_username":
+            uname = txt.lstrip("@")
+            cur.execute("INSERT OR IGNORE INTO channels(username,required,active) VALUES(?,?,?)",(f"@{uname}",1,1))
+            conn.commit()
+            admin_state.pop(uid,None)
+            await m.reply("Kanal qo'shildi")
+            return
+        if s["step"]=="link_name":
+            s["link_name"]=txt
+            s["step"]="link_url"
+            await m.reply("Havola URL ni yuboring")
+            return
+        if s["step"]=="link_url":
+            name = s.get("link_name")
+            url = txt
+            cur.execute("INSERT INTO links(name,url) VALUES(?,?)",(name,url))
+            conn.commit()
+            admin_state.pop(uid,None)
+            await m.reply("Havola qo'shildi")
+            return
+        if s["step"]=="new_admin":
+            try:
+                nid = int(txt)
+                cur.execute("INSERT OR IGNORE INTO admins(id) VALUES(?)",(nid,))
+                conn.commit()
+                admin_state.pop(uid,None)
+                await m.reply("Admin qo'shildi")
+            except:
+                await m.reply("ID raqam bo'lishi kerak")
+            return
+    # foydalanuvchi kod tekshiruvi
+    cur.execute("SELECT id,code,title,size_text,duration_text FROM movies WHERE code=?", (txt,))
+    r = cur.fetchone()
+    if r:
+        mid,code,title,size_text,duration_text = r
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("📥 Kinoni yuklab olish", callback_data=f"download_{mid}")],[InlineKeyboardButton("🎬 Boshqa premyeralar", url="https://t.me/")]])
+        await m.reply(f"🎞️ {title}\n💾 Hajmi: {size_text}\n⏱ Davomiylik: {duration_text}", reply_markup=kb)
+        return
+    await m.reply("Kod topilmadi")
 
-def set_min_withdraw(m):
+@app.on_message(filters.video | filters.document)
+async def media_handler(c, m):
     uid = m.from_user.id
-    try:
-        v = int(m.text.strip())
-        set_setting("min_withdraw", v)
-        bot.send_message(uid, f"Minimal yechish summa o'zgardi: {v}")
-    except:
-        bot.send_message(uid, "Iltimos son kiriting")
-
-def add_channel(m):
-    uid = m.from_user.id
-    chat = m.text.strip()
-    cur.execute("INSERT INTO forced_channels(chat_id) VALUES(?)", (chat,))
-    conn.commit()
-    bot.send_message(uid, "Kanal qo'shildi")
-
-def remove_channel(m):
-    uid = m.from_user.id
-    chat = m.text.strip()
-    cur.execute("DELETE FROM forced_channels WHERE chat_id=?", (chat,))
-    conn.commit()
-    bot.send_message(uid, "Kanal o'chirildi")
-
-def admin_add_balance(m):
-    uid = m.from_user.id
-    parts = m.text.strip().split()
-    try:
-        user_id = int(parts[0])
-        amt = int(parts[1])
-        cur.execute("UPDATE users SET balance = balance + ? WHERE id=?", (amt, user_id))
+    if uid in admin_state and admin_state[uid].get("step")=="video":
+        s = admin_state[uid]
+        file = None
+        if m.video:
+            file = m.video
+        elif m.document:
+            file = m.document
+        if not file:
+            await m.reply("Video topilmadi")
+            return
+        file_id = file.file_id
+        size = getattr(file, "file_size", 0) or 0
+        dur = getattr(file, "duration", 0) or 0
+        size_text = fmt_size(size)
+        h = dur//3600
+        mnt = (dur%3600)//60
+        sec = dur%60
+        duration_text = f"{h}:{mnt:02d}:{sec:02d}" if h else f"{mnt}:{sec:02d}"
+        code = s.get("code")
+        title = s.get("title")
+        now = datetime.utcnow().isoformat()
+        cur.execute("INSERT OR REPLACE INTO movies(code,title,file_id,size_bytes,size_text,duration_seconds,duration_text,uploaded_by,uploaded_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (code,title,file_id,size,size_text,dur,duration_text,uid,now))
         conn.commit()
-        bot.send_message(uid, "Balans yuklandi")
-        try:
-            bot.send_message(user_id, f"Hisobingizga {amt} so'm qo'shildi. Admin tomonidan")
-        except:
-            pass
-    except:
-        bot.send_message(uid, "Format xato. user_id summa")
-
-def admin_broadcast(m):
-    uid = m.from_user.id
-    text = m.text
-    rows = cur.execute("SELECT id FROM users").fetchall()
-    for r in rows:
-        try:
-            bot.send_message(r[0], text)
-        except:
-            pass
-    bot.send_message(uid, "Xabar tarqatildi")
-
-def receive_withdraw_dest(msg, amount):
-    uid = msg.from_user.id
-    dest = msg.text.strip()
-    u = get_user(uid)
-    if not u:
-        bot.send_message(uid, "Foydalanuvchi topilmadi")
+        admin_state.pop(uid,None)
+        await m.reply(f"✅ Kino yuklandi\n{title}\n{code}\n{size_text}\n{duration_text}")
         return
-    if u[2] < amount:
-        bot.send_message(uid, "Hisobingizda yetarli mablag' yo'q")
-        return
-    cur.execute("UPDATE users SET balance = balance - ? WHERE id=?", (amount, uid))
-    cur.execute("INSERT INTO withdraws(user_id,amount,dest,status) VALUES(?,?,?,?)", (uid, amount, dest, "pending"))
-    conn.commit()
-    wid = cur.execute("SELECT last_insert_rowid()").fetchone()[0]
-    kb_text = f"Tasdiqlash_{wid}"
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row(f"✅ Tasdiqlash {wid}", f"❌ Rad etish {wid}")
-    for adm in ADMIN_IDS:
-        try:
-            bot.send_message(adm, f"Yangi pul yechish so'rovi\nID:{wid}\nFoydalanuvchi:{msg.from_user.username or uid}\nSumma:{amount}\nManzil:{dest}", reply_markup=kb)
-        except:
-            pass
-    bot.send_message(uid, "So'rovingiz adminlarga yuborildi. Natijani kuting.")
-
-@bot.message_handler(func=lambda m: m.text and m.from_user.id in ADMIN_IDS)
-def admin_action_handler(m):
-    text = m.text.strip()
-    if text.startswith("✅ Tasdiqlash"):
-        try:
-            wid = int(text.split()[-1])
-            w = cur.execute("SELECT user_id,amount,dest,status FROM withdraws WHERE id=?", (wid,)).fetchone()
-            if not w or w[3] != "pending":
-                bot.send_message(m.from_user.id, "So'rov topilmadi yoki holati o'zgargan")
-                return
-            cur.execute("UPDATE withdraws SET status='approved' WHERE id=?", (wid,))
-            conn.commit()
-            masked = mask_sensitive(w[2])
-            if CHANNEL_ID:
-                bot.send_message(CHANNEL_ID, f"Yangi pul yechish tasdiqlandi.\nID:{wid}\nFoydalanuvchi: {w[0]}\nSumma: {w[1]}\nManzil: {masked}\nHolat: Tasdiqlandi")
-            bot.send_message(w[0], f"Sizning yechish so'rovingiz №{wid} tasdiqlandi. {w[1]} so'm admin tomonidan o'tkazildi.")
-            bot.send_message(m.from_user.id, "Tasdiqlandi")
-        except:
-            bot.send_message(m.from_user.id, "Xato format")
-    if text.startswith("❌ Rad etish"):
-        try:
-            wid = int(text.split()[-1])
-            w = cur.execute("SELECT user_id,amount,dest,status FROM withdraws WHERE id=?", (wid,)).fetchone()
-            if not w or w[3] != "pending":
-                bot.send_message(m.from_user.id, "So'rov topilmadi yoki holati o'zgargan")
-                return
-            cur.execute("UPDATE withdraws SET status='rejected' WHERE id=?", (wid,))
-            conn.commit()
-            cur.execute("UPDATE users SET balance = balance + ? WHERE id=?", (w[1], w[0]))
-            conn.commit()
-            bot.send_message(w[0], f"Sizning yechish so'rovingiz №{wid} rad etildi. Summa hisobingizga qaytarildi.")
-            bot.send_message(m.from_user.id, "Rad etildi va summa qaytarildi")
-        except:
-            bot.send_message(m.from_user.id, "Xato format")
-
-def forward_to_admin(message):
-    for adm in ADMIN_IDS:
-        try:
-            bot.send_message(adm, f"Foydalanuvchidan xabar:\nFrom: @{message.from_user.username or message.from_user.id}\n{message.text}")
-        except:
-            pass
-    bot.send_message(message.chat.id, "Xabaringiz adminlarga yuborildi")
-
-def run_polling():
-    bot.infinity_polling()
 
 if __name__ == "__main__":
-    run_polling()
+    app.run()
