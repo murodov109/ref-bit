@@ -197,7 +197,6 @@ async def text_handler(c, m):
             except:
                 await m.reply("ID raqam bo'lishi kerak")
             return
-    # foydalanuvchi kod tekshiruvi
     cur.execute("SELECT id,code,title,size_text,duration_text FROM movies WHERE code=?", (txt,))
     r = cur.fetchone()
     if r:
