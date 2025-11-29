@@ -2,7 +2,7 @@ import os
 import json
 import asyncio
 from pyrogram import Client, filters, enums
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, Message, ReplyKeyboardMarkup, KeyboardButton
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, Message, ReplyKeyboardMarkup, KeyboardButton, ReplyKeyboardRemove
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -62,11 +62,6 @@ def admin_panel_keyboard():
         [KeyboardButton("🔗 URL link"), KeyboardButton("📊 Statistika")]
     ], resize_keyboard=True)
 
-def user_keyboard():
-    return ReplyKeyboardMarkup([
-        [KeyboardButton("🎬 Film qidirish")]
-    ], resize_keyboard=True)
-
 @app.on_message(filters.command("start") & filters.private)
 async def start_handler(client, message: Message):
     user_id = message.from_user.id
@@ -85,7 +80,7 @@ async def start_handler(client, message: Message):
     
     not_sub = await check_subscription(client, user_id)
     
-    if not_sub or data["request_channel"] or data["url_links"]:
+    if not_sub:
         buttons = []
         
         for ch in not_sub:
@@ -95,16 +90,6 @@ async def start_handler(client, message: Message):
             except:
                 pass
         
-        if data["request_channel"]:
-            try:
-                chat = await client.get_chat(data["request_channel"])
-                buttons.append([InlineKeyboardButton(f"📨 {chat.title}", url=f"https://t.me/{chat.username if chat.username else data['request_channel']}")])
-            except:
-                pass
-        
-        for link in data["url_links"]:
-            buttons.append([InlineKeyboardButton(f"🔗 {link['name']}", url=link['url'])])
-        
         buttons.append([InlineKeyboardButton("✅ Tekshirish", callback_data="check_sub")])
         
         await message.reply_text(
@@ -113,12 +98,34 @@ async def start_handler(client, message: Message):
         )
         return
     
+    if data["request_channel"] or data["url_links"]:
+        extra_buttons = []
+        
+        if data["request_channel"]:
+            try:
+                chat = await client.get_chat(data["request_channel"])
+                extra_buttons.append([InlineKeyboardButton(f"📨 {chat.title}", url=f"https://t.me/{chat.username if chat.username else data['request_channel']}")])
+            except:
+                pass
+        
+        for link in data["url_links"]:
+            extra_buttons.append([InlineKeyboardButton(f"🔗 {link['name']}", url=link['url'])])
+        
+        if extra_buttons:
+            extra_buttons.append([InlineKeyboardButton("✅ Davom etish", callback_data="continue")])
+            
+            await message.reply_text(
+                "🎬 Botdan to'liq foydalanish uchun qo'shimcha kanallarga ham obuna bo'ling:",
+                reply_markup=InlineKeyboardMarkup(extra_buttons)
+            )
+            return
+    
     await message.reply_text(
         f"👋 Salom {message.from_user.first_name}!\n\n"
         "🎬 Siz bu bot orqali istalgan film kodini kiritib topishingiz mumkin.\n\n"
         "🎥 Eng so'ngi premyeralar bizda!\n\n"
         "📝 Film kodini yuboring:",
-        reply_markup=user_keyboard()
+        reply_markup=ReplyKeyboardRemove()
     )
 
 @app.on_callback_query(filters.regex("check_sub"))
@@ -127,18 +134,51 @@ async def check_sub_handler(client, callback: CallbackQuery):
     not_sub = await check_subscription(client, user_id)
     
     if not_sub:
-        await callback.answer("❌ Siz hali barcha majburiy kanallarga obuna bo'lmadingiz!", show_alert=True)
+        await callback.answer("❌ Siz hali majburiy kanallarga obuna bo'lmadingiz!", show_alert=True)
         return
     
     await callback.message.delete()
+    
+    if data["request_channel"] or data["url_links"]:
+        extra_buttons = []
+        
+        if data["request_channel"]:
+            try:
+                chat = await client.get_chat(data["request_channel"])
+                extra_buttons.append([InlineKeyboardButton(f"📨 {chat.title}", url=f"https://t.me/{chat.username if chat.username else data['request_channel']}")])
+            except:
+                pass
+        
+        for link in data["url_links"]:
+            extra_buttons.append([InlineKeyboardButton(f"🔗 {link['name']}", url=link['url'])])
+        
+        if extra_buttons:
+            extra_buttons.append([InlineKeyboardButton("✅ Davom etish", callback_data="continue")])
+            
+            await callback.message.reply_text(
+                "🎬 Botdan to'liq foydalanish uchun qo'shimcha kanallarga ham obuna bo'ling:",
+                reply_markup=InlineKeyboardMarkup(extra_buttons)
+            )
+            return
+    
     await callback.message.reply_text(
         f"✅ Obuna tasdiqlandi!\n\n"
         f"👋 Salom {callback.from_user.first_name}!\n\n"
         "🎬 Siz bu bot orqali istalgan film kodini kiritib topishingiz mumkin.\n\n"
         "🎥 Eng so'ngi premyeralar bizda!\n\n"
-        "📝 Film kodini yuboring:",
-        reply_markup=user_keyboard()
+        "📝 Film kodini yuboring:"
     )
+
+@app.on_callback_query(filters.regex("continue"))
+async def continue_handler(client, callback: CallbackQuery):
+    await callback.message.delete()
+    await callback.message.reply_text(
+        f"👋 Salom {callback.from_user.first_name}!\n\n"
+        "🎬 Siz bu bot orqali istalgan film kodini kiritib topishingiz mumkin.\n\n"
+        "🎥 Eng so'ngi premyeralar bizda!\n\n"
+        "📝 Film kodini yuboring:"
+    )
+    await callback.answer()
 
 @app.on_message(filters.private & filters.text)
 async def message_handler(client, message: Message):
@@ -147,7 +187,7 @@ async def message_handler(client, message: Message):
     
     if not is_admin(user_id):
         not_sub = await check_subscription(client, user_id)
-        if not_sub or data["request_channel"] or data["url_links"]:
+        if not_sub:
             buttons = []
             
             for ch in not_sub:
@@ -157,20 +197,10 @@ async def message_handler(client, message: Message):
                 except:
                     pass
             
-            if data["request_channel"]:
-                try:
-                    chat = await client.get_chat(data["request_channel"])
-                    buttons.append([InlineKeyboardButton(f"📨 {chat.title}", url=f"https://t.me/{chat.username if chat.username else data['request_channel']}")])
-                except:
-                    pass
-            
-            for link in data["url_links"]:
-                buttons.append([InlineKeyboardButton(f"🔗 {link['name']}", url=link['url'])])
-            
             buttons.append([InlineKeyboardButton("✅ Tekshirish", callback_data="check_sub")])
             
             await message.reply_text(
-                "❗️ Botdan foydalanish uchun quyidagi kanallarga obuna bo'ling:",
+                "❗️ Botdan foydalanish uchun majburiy kanallarga obuna bo'ling:",
                 reply_markup=InlineKeyboardMarkup(buttons)
             )
             return
@@ -392,10 +422,6 @@ async def message_handler(client, message: Message):
         elif text == "🔙 Orqaga":
             await message.reply_text("🎛️ Admin panel:", reply_markup=admin_panel_keyboard())
         
-        return
-    
-    if text == "🎬 Film qidirish":
-        await message.reply_text("📝 Film kodini yuboring:")
         return
     
     code = text.strip()
