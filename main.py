@@ -1,5 +1,6 @@
 import os
 import json
+import asyncio
 from pyrogram import Client, filters, enums
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, Message, ReplyKeyboardMarkup, KeyboardButton
 from datetime import datetime
@@ -50,15 +51,7 @@ async def check_subscription(client, user_id):
         except:
             not_subscribed.append(ch)
     
-    if data["request_channel"]:
-        try:
-            member = await client.get_chat_member(data["request_channel"], user_id)
-            if member.status in [enums.ChatMemberStatus.LEFT, enums.ChatMemberStatus.BANNED]:
-                not_subscribed.append(data["request_channel"])
-        except:
-            not_subscribed.append(data["request_channel"])
-    
-    return not_subscribed, data["url_links"]
+    return not_subscribed
 
 def admin_panel_keyboard():
     return ReplyKeyboardMarkup([
@@ -90,10 +83,11 @@ async def start_handler(client, message: Message):
         )
         return
     
-    not_sub, urls = await check_subscription(client, user_id)
+    not_sub = await check_subscription(client, user_id)
     
-    if not_sub or urls:
+    if not_sub or data["request_channel"] or data["url_links"]:
         buttons = []
+        
         for ch in not_sub:
             try:
                 chat = await client.get_chat(ch)
@@ -101,7 +95,14 @@ async def start_handler(client, message: Message):
             except:
                 pass
         
-        for link in urls:
+        if data["request_channel"]:
+            try:
+                chat = await client.get_chat(data["request_channel"])
+                buttons.append([InlineKeyboardButton(f"📨 {chat.title}", url=f"https://t.me/{chat.username if chat.username else data['request_channel']}")])
+            except:
+                pass
+        
+        for link in data["url_links"]:
             buttons.append([InlineKeyboardButton(f"🔗 {link['name']}", url=link['url'])])
         
         buttons.append([InlineKeyboardButton("✅ Tekshirish", callback_data="check_sub")])
@@ -123,10 +124,10 @@ async def start_handler(client, message: Message):
 @app.on_callback_query(filters.regex("check_sub"))
 async def check_sub_handler(client, callback: CallbackQuery):
     user_id = callback.from_user.id
-    not_sub, urls = await check_subscription(client, user_id)
+    not_sub = await check_subscription(client, user_id)
     
-    if not_sub or urls:
-        await callback.answer("❌ Siz hali barcha kanallarga obuna bo'lmadingiz!", show_alert=True)
+    if not_sub:
+        await callback.answer("❌ Siz hali barcha majburiy kanallarga obuna bo'lmadingiz!", show_alert=True)
         return
     
     await callback.message.delete()
@@ -145,9 +146,10 @@ async def message_handler(client, message: Message):
     text = message.text
     
     if not is_admin(user_id):
-        not_sub, urls = await check_subscription(client, user_id)
-        if not_sub or urls:
+        not_sub = await check_subscription(client, user_id)
+        if not_sub or data["request_channel"] or data["url_links"]:
             buttons = []
+            
             for ch in not_sub:
                 try:
                     chat = await client.get_chat(ch)
@@ -155,7 +157,14 @@ async def message_handler(client, message: Message):
                 except:
                     pass
             
-            for link in urls:
+            if data["request_channel"]:
+                try:
+                    chat = await client.get_chat(data["request_channel"])
+                    buttons.append([InlineKeyboardButton(f"📨 {chat.title}", url=f"https://t.me/{chat.username if chat.username else data['request_channel']}")])
+                except:
+                    pass
+            
+            for link in data["url_links"]:
                 buttons.append([InlineKeyboardButton(f"🔗 {link['name']}", url=link['url'])])
             
             buttons.append([InlineKeyboardButton("✅ Tekshirish", callback_data="check_sub")])
@@ -421,52 +430,68 @@ async def media_handler(client, message: Message):
     if not is_admin(user_id):
         return
     
-    if user_id in temp_data:
-        action = temp_data[user_id]["action"]
+    if user_id not in temp_data:
+        return
+    
+    action = temp_data[user_id]["action"]
+    
+    if action == "add_film" and temp_data[user_id].get("step") == "video":
+        if not message.video:
+            await message.reply_text("❌ Iltimos, video yuboring!")
+            return
         
-        if action == "add_film" and temp_data[user_id].get("step") == "video":
-            if not message.video:
-                await message.reply_text("❌ Iltimos, video yuboring!")
-                return
-            
-            temp_data[user_id]["video"] = message.video.file_id
-            temp_data[user_id]["duration"] = message.video.duration
-            temp_data[user_id]["size"] = message.video.file_size
-            temp_data[user_id]["step"] = "name"
-            await message.reply_text("📝 Kino nomini kiriting:")
+        temp_data[user_id]["video"] = message.video.file_id
+        temp_data[user_id]["duration"] = message.video.duration
+        temp_data[user_id]["size"] = message.video.file_size
+        temp_data[user_id]["step"] = "name"
+        await message.reply_text("📝 Kino nomini kiriting:")
+    
+    elif action == "broadcast":
+        success = 0
+        failed = 0
         
-        elif action == "broadcast":
-            success = 0
-            failed = 0
+        status_msg = await message.reply_text("📤 Reklama yuborilmoqda...")
+        
+        for uid in data["users"]:
+            try:
+                if message.text:
+                    await client.send_message(uid, message.text)
+                elif message.photo:
+                    await client.send_photo(uid, message.photo.file_id, caption=message.caption or "")
+                elif message.video:
+                    await client.send_video(uid, message.video.file_id, caption=message.caption or "")
+                success += 1
+            except Exception as e:
+                failed += 1
             
-            status_msg = await message.reply_text("📤 Yuborilmoqda...")
-            
-            for uid in data["users"]:
+            if (success + failed) % 20 == 0:
                 try:
-                    if message.text:
-                        await client.send_message(uid, message.text)
-                    elif message.photo:
-                        await client.send_photo(uid, message.photo.file_id, caption=message.caption)
-                    elif message.video:
-                        await client.send_video(uid, message.video.file_id, caption=message.caption)
-                    success += 1
-                except:
-                    failed += 1
-                
-                if (success + failed) % 50 == 0:
                     await status_msg.edit_text(
                         f"📤 Yuborilmoqda...\n\n"
                         f"✅ Yuborildi: {success}\n"
                         f"❌ Xato: {failed}"
                     )
+                except:
+                    pass
             
+            await asyncio.sleep(0.05)
+        
+        try:
             await status_msg.edit_text(
                 f"✅ Reklama yuborildi!\n\n"
                 f"✅ Muvaffaqiyatli: {success}\n"
                 f"❌ Xato: {failed}",
                 reply_markup=admin_panel_keyboard()
             )
-            del temp_data[user_id]
+        except:
+            await message.reply_text(
+                f"✅ Reklama yuborildi!\n\n"
+                f"✅ Muvaffaqiyatli: {success}\n"
+                f"❌ Xato: {failed}",
+                reply_markup=admin_panel_keyboard()
+            )
+        
+        del temp_data[user_id]
 
 print("🤖 Bot ishga tushdi!")
 app.run()
