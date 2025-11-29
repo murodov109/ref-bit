@@ -1,198 +1,470 @@
 import os
-import sqlite3
-import time
+import json
+from pyrogram import Client, filters, enums
+from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, Message
 from datetime import datetime
-from pyrogram import Client, filters
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from dotenv import load_dotenv
+
+load_dotenv()
 
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMINS = set(int(x) for x in os.getenv("ADMINS","").split(",") if x.strip())
+OWNER_ID = int(os.getenv("OWNER_ID"))
 
 app = Client("kino_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
-# DB
-conn = sqlite3.connect("bot.db", check_same_thread=False)
-cur = conn.cursor()
-cur.execute("CREATE TABLE IF NOT EXISTS admins(id INTEGER PRIMARY KEY)")
-cur.execute("CREATE TABLE IF NOT EXISTS channels(username TEXT PRIMARY KEY, required INTEGER DEFAULT 1, active INTEGER DEFAULT 1)")
-cur.execute("CREATE TABLE IF NOT EXISTS links(name TEXT, url TEXT)")
-cur.execute("CREATE TABLE IF NOT EXISTS requests(name TEXT)")
-cur.execute("""CREATE TABLE IF NOT EXISTS movies(
- id INTEGER PRIMARY KEY AUTOINCREMENT,
- code TEXT UNIQUE,
- title TEXT,
- file_id TEXT,
- size_bytes INTEGER,
- size_text TEXT,
- duration_seconds INTEGER,
- duration_text TEXT,
- uploaded_by INTEGER,
- uploaded_at TEXT
-)""")
-conn.commit()
-for a in ADMINS:
-    cur.execute("INSERT OR IGNORE INTO admins(id) VALUES(?)",(a,))
-conn.commit()
+DATA_FILE = "database.json"
+temp_data = {}
 
-states = {}
+def load_data():
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return {
+        "films": {},
+        "admins": [],
+        "users": [],
+        "channels": [],
+        "request_channel": None,
+        "url_links": []
+    }
 
-def fmt_size(n):
-    mb = n/1024/1024
-    return f"{mb:.0f} MB" if mb<1024 else f"{mb/1024:.2f} GB"
+def save_data(data):
+    with open(DATA_FILE, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
-def mk_start_markup():
-    rows=[]
-    for r in cur.execute("SELECT username FROM channels WHERE active=1"):
-        rows.append([InlineKeyboardButton(r[0], url=f"https://t.me/{r[0].lstrip('@')}")])
-    if cur.execute("SELECT name,url FROM links").fetchall():
-        rows.append([InlineKeyboardButton("🔗 Qo'shimcha havolalar", callback_data="show_links")])
-    if cur.execute("SELECT name FROM requests").fetchone():
-        rows.append([InlineKeyboardButton("📣 Zayafka", callback_data="show_requests")])
-    rows.append([InlineKeyboardButton("✅ Tasdiqlash", callback_data="check_subs")])
-    return InlineKeyboardMarkup(rows)
+data = load_data()
 
-def mk_admin_panel():
+def is_admin(user_id):
+    return user_id == OWNER_ID or user_id in data["admins"]
+
+async def check_subscription(client, user_id):
+    not_subscribed = []
+    
+    for ch in data["channels"]:
+        try:
+            member = await client.get_chat_member(ch, user_id)
+            if member.status in [enums.ChatMemberStatus.LEFT, enums.ChatMemberStatus.BANNED]:
+                not_subscribed.append(ch)
+        except:
+            not_subscribed.append(ch)
+    
+    if data["request_channel"]:
+        try:
+            member = await client.get_chat_member(data["request_channel"], user_id)
+            if member.status in [enums.ChatMemberStatus.LEFT, enums.ChatMemberStatus.BANNED]:
+                not_subscribed.append(data["request_channel"])
+        except:
+            not_subscribed.append(data["request_channel"])
+    
+    return not_subscribed, data["url_links"]
+
+def admin_panel_keyboard():
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📁 Filmlar", callback_data="admin_movies")],
-        [InlineKeyboardButton("📡 Kanallar", callback_data="admin_channels"), InlineKeyboardButton("🔗 Havolalar", callback_data="admin_links")],
-        [InlineKeyboardButton("👥 Adminlar", callback_data="admin_admins"), InlineKeyboardButton("📊 Statistika", callback_data="admin_stats")],
-        [InlineKeyboardButton("📣 Zayafka", callback_data="admin_requests"), InlineKeyboardButton("⚙️ Sozlamalar", callback_data="admin_settings")]
+        [InlineKeyboardButton("➕ Film qo'shish", callback_data="add_film"),
+         InlineKeyboardButton("🗑 Film o'chirish", callback_data="delete_film")],
+        [InlineKeyboardButton("👤 Admin qo'shish", callback_data="add_admin"),
+         InlineKeyboardButton("❌ Admin o'chirish", callback_data="delete_admin")],
+        [InlineKeyboardButton("📢 Reklama tarqatish", callback_data="broadcast")],
+        [InlineKeyboardButton("📺 Majburiy obuna", callback_data="manage_channels")],
+        [InlineKeyboardButton("📨 Zayafka kanal", callback_data="request_channel")],
+        [InlineKeyboardButton("🔗 URL link", callback_data="url_links")],
+        [InlineKeyboardButton("📊 Statistika", callback_data="statistics")]
     ])
 
-@app.on_message(filters.private & filters.command("start"))
-async def start(_, m):
-    uid = m.from_user.id
-    if cur.execute("SELECT 1 FROM admins WHERE id=?",(uid,)).fetchone():
-        await m.reply("Admin panel", reply_markup=mk_admin_panel())
+@app.on_message(filters.command("start") & filters.private)
+async def start_handler(client, message: Message):
+    user_id = message.from_user.id
+    
+    if user_id not in data["users"]:
+        data["users"].append(user_id)
+        save_data(data)
+    
+    if is_admin(user_id):
+        await message.reply_text(
+            f"👋 Salom {message.from_user.first_name}!\n\n"
+            "🎬 Siz administratorsiz. Admin panelni boshqaring:",
+            reply_markup=admin_panel_keyboard()
+        )
         return
-    await m.reply(f"🎬 Assalomu alaykum, {m.from_user.first_name}!\nIltimos majburiy kanallarga obuna bo‘ling va tasdiqlang.", reply_markup=mk_start_markup())
+    
+    not_sub, urls = await check_subscription(client, user_id)
+    
+    if not_sub or urls:
+        buttons = []
+        for ch in not_sub:
+            try:
+                chat = await client.get_chat(ch)
+                buttons.append([InlineKeyboardButton(f"📢 {chat.title}", url=f"https://t.me/{chat.username if chat.username else ch}")])
+            except:
+                pass
+        
+        for link in urls:
+            buttons.append([InlineKeyboardButton(f"🔗 {link['name']}", url=link['url'])])
+        
+        buttons.append([InlineKeyboardButton("✅ Tekshirish", callback_data="check_sub")])
+        
+        await message.reply_text(
+            "❗️ Botdan foydalanish uchun quyidagi kanallarga obuna bo'ling:",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return
+    
+    await message.reply_text(
+        f"👋 Salom {message.from_user.first_name}!\n\n"
+        "🎬 Siz bu bot orqali istalgan film kodini kiritib topishingiz mumkin.\n\n"
+        "🎥 Eng so'ngi premyeralar bizda!\n\n"
+        "📝 Film kodini yuboring:",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📢 Kanal", url=f"https://t.me/{(await client.get_me()).username}")]
+        ])
+    )
+
+@app.on_callback_query(filters.regex("check_sub"))
+async def check_sub_handler(client, callback: CallbackQuery):
+    user_id = callback.from_user.id
+    not_sub, urls = await check_subscription(client, user_id)
+    
+    if not_sub or urls:
+        await callback.answer("❌ Siz hali barcha kanallarga obuna bo'lmadingiz!", show_alert=True)
+        return
+    
+    await callback.message.delete()
+    await callback.message.reply_text(
+        f"✅ Obuna tasdiqlandi!\n\n"
+        f"👋 Salom {callback.from_user.first_name}!\n\n"
+        "🎬 Siz bu bot orqali istalgan film kodini kiritib topishingiz mumkin.\n\n"
+        "🎥 Eng so'ngi premyeralar bizda!\n\n"
+        "📝 Film kodini yuboring:"
+    )
 
 @app.on_callback_query()
-async def cb(_, q):
-    uid = q.from_user.id
-    data = q.data or ""
-    if data=="check_subs":
-        missing=[]
-        for r in cur.execute("SELECT username FROM channels WHERE active=1 AND required=1"):
+async def callback_handler(client, callback: CallbackQuery):
+    user_id = callback.from_user.id
+    query_data = callback.data
+    
+    if not is_admin(user_id) and query_data != "check_sub":
+        await callback.answer("❌ Sizda ruxsat yo'q!", show_alert=True)
+        return
+    
+    if query_data == "add_film":
+        temp_data[user_id] = {"action": "add_film", "step": "video"}
+        await callback.message.reply_text("🎥 Kino videosini yuboring:")
+        await callback.answer()
+    
+    elif query_data == "delete_film":
+        temp_data[user_id] = {"action": "delete_film"}
+        await callback.message.reply_text("🗑 O'chirish uchun film kodini yuboring:")
+        await callback.answer()
+    
+    elif query_data == "add_admin":
+        temp_data[user_id] = {"action": "add_admin"}
+        await callback.message.reply_text("👤 Yangi admin ID raqamini yuboring:")
+        await callback.answer()
+    
+    elif query_data == "delete_admin":
+        temp_data[user_id] = {"action": "delete_admin"}
+        await callback.message.reply_text("❌ O'chirish uchun admin ID raqamini yuboring:")
+        await callback.answer()
+    
+    elif query_data == "broadcast":
+        temp_data[user_id] = {"action": "broadcast"}
+        await callback.message.reply_text("📢 Yuborish uchun xabar, rasm yoki video yuboring:")
+        await callback.answer()
+    
+    elif query_data == "manage_channels":
+        await callback.message.reply_text(
+            "📺 Majburiy obuna kanallari:\n\n"
+            "➕ Kanal qo'shish: /addchannel @username yoki ID\n"
+            "➖ Kanal o'chirish: /delchannel @username yoki ID"
+        )
+        await callback.answer()
+    
+    elif query_data == "request_channel":
+        await callback.message.reply_text(
+            "📨 Zayafka kanali:\n\n"
+            "➕ Qo'shish: /setrequest @username yoki ID\n"
+            "➖ O'chirish: /delrequest"
+        )
+        await callback.answer()
+    
+    elif query_data == "url_links":
+        await callback.message.reply_text(
+            "🔗 URL linklar:\n\n"
+            "➕ Qo'shish: /addurl nom | havola\n"
+            "➖ O'chirish: /delurl nom"
+        )
+        await callback.answer()
+    
+    elif query_data == "statistics":
+        total_users = len(data["users"])
+        total_films = len(data["films"])
+        total_admins = len(data["admins"]) + 1
+        
+        await callback.message.reply_text(
+            f"📊 **Statistika:**\n\n"
+            f"👥 Foydalanuvchilar: {total_users}\n"
+            f"🎬 Filmlar: {total_films}\n"
+            f"👤 Adminlar: {total_admins}",
+            parse_mode=enums.ParseMode.MARKDOWN
+        )
+        await callback.answer()
+
+@app.on_message(filters.private & ~filters.command("start"))
+async def message_handler(client, message: Message):
+    user_id = message.from_user.id
+    
+    if user_id in temp_data:
+        action = temp_data[user_id]["action"]
+        
+        if action == "add_film":
+            step = temp_data[user_id]["step"]
+            
+            if step == "video":
+                if not message.video:
+                    await message.reply_text("❌ Iltimos, video yuboring!")
+                    return
+                temp_data[user_id]["video"] = message.video.file_id
+                temp_data[user_id]["duration"] = message.video.duration
+                temp_data[user_id]["size"] = message.video.file_size
+                temp_data[user_id]["step"] = "name"
+                await message.reply_text("📝 Kino nomini kiriting:")
+            
+            elif step == "name":
+                temp_data[user_id]["name"] = message.text
+                temp_data[user_id]["step"] = "code"
+                await message.reply_text("🔢 Kino kodini yozing:")
+            
+            elif step == "code":
+                code = message.text.strip()
+                if code in data["films"]:
+                    await message.reply_text("❌ Bu kod band! Boshqa kod kiriting:")
+                    return
+                
+                data["films"][code] = {
+                    "name": temp_data[user_id]["name"],
+                    "file_id": temp_data[user_id]["video"],
+                    "duration": temp_data[user_id]["duration"],
+                    "size": temp_data[user_id]["size"],
+                    "added_by": user_id,
+                    "added_at": datetime.now().isoformat()
+                }
+                save_data(data)
+                
+                del temp_data[user_id]
+                await message.reply_text(
+                    f"✅ Film muvaffaqiyatli qo'shildi!\n\n"
+                    f"🎬 Kod: `{code}`",
+                    parse_mode=enums.ParseMode.MARKDOWN,
+                    reply_markup=admin_panel_keyboard()
+                )
+        
+        elif action == "delete_film":
+            code = message.text.strip()
+            if code in data["films"]:
+                del data["films"][code]
+                save_data(data)
+                await message.reply_text("✅ Film o'chirildi!", reply_markup=admin_panel_keyboard())
+            else:
+                await message.reply_text("❌ Bunday kodli film topilmadi!")
+            del temp_data[user_id]
+        
+        elif action == "add_admin":
             try:
-                mem = await app.get_chat_member(r[0], uid)
-                if mem.status not in ("member","administrator","creator"):
-                    missing.append(r[0])
+                new_admin = int(message.text.strip())
+                if new_admin in data["admins"]:
+                    await message.reply_text("❌ Bu foydalanuvchi allaqachon admin!")
+                else:
+                    data["admins"].append(new_admin)
+                    save_data(data)
+                    await message.reply_text("✅ Admin qo'shildi!", reply_markup=admin_panel_keyboard())
             except:
-                missing.append(r[0])
-        if missing:
-            await q.message.edit("Quyidagi kanallarga obuna bo‘lishingiz kerak:\n"+ "\n".join(missing), reply_markup=mk_start_markup())
+                await message.reply_text("❌ Noto'g'ri ID!")
+            del temp_data[user_id]
+        
+        elif action == "delete_admin":
+            try:
+                admin_id = int(message.text.strip())
+                if admin_id in data["admins"]:
+                    data["admins"].remove(admin_id)
+                    save_data(data)
+                    await message.reply_text("✅ Admin o'chirildi!", reply_markup=admin_panel_keyboard())
+                else:
+                    await message.reply_text("❌ Bunday admin topilmadi!")
+            except:
+                await message.reply_text("❌ Noto'g'ri ID!")
+            del temp_data[user_id]
+        
+        elif action == "broadcast":
+            success = 0
+            failed = 0
+            
+            status_msg = await message.reply_text("📤 Yuborilmoqda...")
+            
+            for uid in data["users"]:
+                try:
+                    if message.text:
+                        await client.send_message(uid, message.text)
+                    elif message.photo:
+                        await client.send_photo(uid, message.photo.file_id, caption=message.caption)
+                    elif message.video:
+                        await client.send_video(uid, message.video.file_id, caption=message.caption)
+                    success += 1
+                except:
+                    failed += 1
+                
+                if (success + failed) % 50 == 0:
+                    await status_msg.edit_text(
+                        f"📤 Yuborilmoqda...\n\n"
+                        f"✅ Yuborildi: {success}\n"
+                        f"❌ Xato: {failed}"
+                    )
+            
+            await status_msg.edit_text(
+                f"✅ Reklama yuborildi!\n\n"
+                f"✅ Muvaffaqiyatli: {success}\n"
+                f"❌ Xato: {failed}",
+                reply_markup=admin_panel_keyboard()
+            )
+            del temp_data[user_id]
+        
+        return
+    
+    if is_admin(user_id):
+        return
+    
+    not_sub, urls = await check_subscription(client, user_id)
+    if not_sub or urls:
+        buttons = []
+        for ch in not_sub:
+            try:
+                chat = await client.get_chat(ch)
+                buttons.append([InlineKeyboardButton(f"📢 {chat.title}", url=f"https://t.me/{chat.username if chat.username else ch}")])
+            except:
+                pass
+        
+        for link in urls:
+            buttons.append([InlineKeyboardButton(f"🔗 {link['name']}", url=link['url'])])
+        
+        buttons.append([InlineKeyboardButton("✅ Tekshirish", callback_data="check_sub")])
+        
+        await message.reply_text(
+            "❗️ Botdan foydalanish uchun quyidagi kanallarga obuna bo'ling:",
+            reply_markup=InlineKeyboardMarkup(buttons)
+        )
+        return
+    
+    code = message.text.strip()
+    if code in data["films"]:
+        film = data["films"][code]
+        duration_min = film["duration"] // 60
+        size_mb = film["size"] / (1024 * 1024)
+        
+        bot_username = (await client.get_me()).username
+        
+        caption = (
+            f"🎬 **{film['name']}**\n\n"
+            f"⏱ Davomiyligi: {duration_min} daqiqa\n"
+            f"📦 Hajmi: {size_mb:.1f} MB\n"
+            f"🔢 Kodi: `{code}`\n\n"
+            f"Bizdan uzoqlashmang, eng so'ngi premyeralar bizda!\n"
+            f"@{bot_username}"
+        )
+        
+        await message.reply_video(
+            film["file_id"],
+            caption=caption,
+            parse_mode=enums.ParseMode.MARKDOWN
+        )
+    else:
+        await message.reply_text("❌ Bunday kodli film topilmadi!")
+
+@app.on_message(filters.command("addchannel") & filters.private)
+async def add_channel(client, message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    
+    try:
+        channel = message.text.split(maxsplit=1)[1].strip()
+        
+        if channel not in data["channels"]:
+            data["channels"].append(channel)
+            save_data(data)
+            await message.reply_text("✅ Kanal qo'shildi!")
         else:
-            await q.message.edit("🎉 Siz barcha majburiy kanallarga obuna bo'lgansiz. Endi kino kodini yuboring.")
-        await q.answer()
-        return
-    if data=="show_links":
-        rows = cur.execute("SELECT name,url FROM links").fetchall()
-        txt="\n".join(f"{r[0]} — {r[1]}" for r in rows) if rows else "Havola mavjud emas"
-        await q.message.reply(txt)
-        await q.answer()
-        return
-    if data=="show_requests":
-        rows = cur.execute("SELECT name FROM requests").fetchall()
-        txt="\n".join(r[0] for r in rows) if rows else "Zayafka yo'q"
-        await q.message.reply(txt)
-        await q.answer()
-        return
-    if data.startswith("admin_"):
-        if not cur.execute("SELECT 1 FROM admins WHERE id=?",(uid,)).fetchone():
-            await q.answer("Access denied", show_alert=True)
-            return
-        key=data.split("admin_",1)[1]
-        if key=="movies":
-            kb=[[InlineKeyboardButton("➕ Yangi film", callback_data="add_movie")],[InlineKeyboardButton("📜 Filmlar ro'yxati", callback_data="list_movies")]]
-            await q.message.edit("Filmlar", reply_markup=InlineKeyboardMarkup(kb))
-            return
-        if key=="channels":
-            kb=[[InlineKeyboardButton("➕ Kanal qo'shish", callback_data="add_channel")],[InlineKeyboardButton("📜 Kanallar", callback_data="list_channels")]]
-            await q.message.edit("Kanallar", reply_markup=InlineKeyboardMarkup(kb))
-            return
-        if key=="links":
-            kb=[[InlineKeyboardButton("➕ Havola qo'shish", callback_data="add_link")],[InlineKeyboardButton("📜 Havolalar", callback_data="list_links")]]
-            await q.message.edit("Havolalar", reply_markup=InlineKeyboardMarkup(kb))
-            return
-        if key=="admins":
-            kb=[[InlineKeyboardButton("➕ Admin qo'shish", callback_data="add_admin")],[InlineKeyboardButton("📜 Adminlar", callback_data="list_admins")]]
-            await q.message.edit("Adminlar", reply_markup=InlineKeyboardMarkup(kb))
-            return
-        if key=="requests":
-            kb=[[InlineKeyboardButton("➕ Zayafka qo'shish", callback_data="add_request")],[InlineKeyboardButton("📜 Zayafkalar", callback_data="list_requests")]]
-            await q.message.edit("Zayafka", reply_markup=InlineKeyboardMarkup(kb))
-            return
-        if key=="stats":
-            cnt=cur.execute("SELECT COUNT(*) FROM movies").fetchone()[0]
-            await q.message.edit(f"Filmlar soni: {cnt}", reply_markup=mk_admin_panel())
-            return
-    if data=="add_movie":
-        states[uid]={"step":"code"}
-        await q.message.reply("1) Kino kodini yuboring")
-        return
-    if data=="list_movies":
-        rows=cur.execute("SELECT code,title,uploaded_at FROM movies ORDER BY id DESC").fetchall()
-        txt="\n".join(f"{r[0]} — {r[1]} — {r[2]}" for r in rows) if rows else "Film yo'q"
-        await q.message.reply(txt)
-        return
-    if data.startswith("download_"):
-        mid=int(data.split("_",1)[1])
-        row=cur.execute("SELECT file_id FROM movies WHERE id=?",(mid,)).fetchone()
-        if row: await q.message.reply_video(row[0])
-        await q.answer()
-        return
+            await message.reply_text("❌ Bu kanal allaqachon qo'shilgan!")
+    except:
+        await message.reply_text("❌ Format: /addchannel @username")
 
-@app.on_message(filters.private & filters.text & ~filters.regex(r'^/'))
-async def text_handler(_, m):
-    uid=m.from_user.id
-    txt=m.text.strip()
-    if uid in states:
-        s=states[uid]
-        step=s.get("step")
-        if step=="code":
-            s["code"]=txt
-            s["step"]="title"
-            await m.reply("2) Kino nomini yuboring")
-            return
-        if step=="title":
-            s["title"]=txt
-            s["step"]="video"
-            await m.reply("3) Endi video faylini yuboring (video yoki document)")
-            return
-    row=cur.execute("SELECT id,code,title,size_text,duration_text FROM movies WHERE code=?",(txt,)).fetchone()
-    if row:
-        mid,code,title,size_text,duration_text=row
-        kb=InlineKeyboardMarkup([[InlineKeyboardButton("📥 Yuklab olish", callback_data=f"download_{mid}")],[InlineKeyboardButton("🎬 Boshqa premyeralar", url="https://t.me/")]])
-        await m.reply(f"🎞️ {title}\n💾 Hajmi: {size_text}\n⏱ Davomiylik: {duration_text}", reply_markup=kb)
+@app.on_message(filters.command("delchannel") & filters.private)
+async def del_channel(client, message: Message):
+    if not is_admin(message.from_user.id):
         return
-    await m.reply("Kod topilmadi")
+    
+    try:
+        channel = message.text.split(maxsplit=1)[1].strip()
+        
+        if channel in data["channels"]:
+            data["channels"].remove(channel)
+            save_data(data)
+            await message.reply_text("✅ Kanal o'chirildi!")
+        else:
+            await message.reply_text("❌ Bunday kanal topilmadi!")
+    except:
+        await message.reply_text("❌ Format: /delchannel @username")
 
-@app.on_message(filters.private & (filters.video | filters.document))
-async def media_handler(_, m):
-    uid=m.from_user.id
-    if uid not in states or states[uid].get("step")!="video": return
-    s=states[uid]
-    file=m.video or m.document
-    file_id=file.file_id
-    size=getattr(file,"file_size",0)
-    dur=getattr(file,"duration",0) or 0
-    size_text=fmt_size(size)
-    h=dur//3600
-    mnt=(dur%3600)//60
-    sec=dur%60
-    duration_text=f"{h}:{mnt:02d}:{sec:02d}" if h else f"{mnt}:{sec:02d}"
-    code=s.get("code")
-    title=s.get("title")
-    now=datetime.utcnow().isoformat()
-    cur.execute("INSERT OR REPLACE INTO movies(code,title,file_id,size_bytes,size_text,duration_seconds,duration_text,uploaded_by,uploaded_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                (code,title,file_id,size,size_text,dur,duration_text,uid,now))
-    conn.commit()
-    states.pop(uid)
-    await m.reply(f"✅ Kino yuklandi\n{title}\n{code}\n{size_text}\n{duration_text}")
+@app.on_message(filters.command("setrequest") & filters.private)
+async def set_request(client, message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    
+    try:
+        channel = message.text.split(maxsplit=1)[1].strip()
+        data["request_channel"] = channel
+        save_data(data)
+        await message.reply_text("✅ Zayafka kanal qo'shildi!")
+    except:
+        await message.reply_text("❌ Format: /setrequest @username")
 
-if __name__=="__main__":
-    print("Bot ishga tushdi")
-    app.run()
+@app.on_message(filters.command("delrequest") & filters.private)
+async def del_request(client, message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    
+    data["request_channel"] = None
+    save_data(data)
+    await message.reply_text("✅ Zayafka kanal o'chirildi!")
+
+@app.on_message(filters.command("addurl") & filters.private)
+async def add_url(client, message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    
+    try:
+        text = message.text.split(maxsplit=1)[1]
+        name, url = text.split("|")
+        name = name.strip()
+        url = url.strip()
+        
+        data["url_links"].append({"name": name, "url": url})
+        save_data(data)
+        await message.reply_text("✅ URL link qo'shildi!")
+    except:
+        await message.reply_text("❌ Format: /addurl nom | havola")
+
+@app.on_message(filters.command("delurl") & filters.private)
+async def del_url(client, message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    
+    try:
+        name = message.text.split(maxsplit=1)[1].strip()
+        data["url_links"] = [l for l in data["url_links"] if l["name"] != name]
+        save_data(data)
+        await message.reply_text("✅ URL link o'chirildi!")
+    except:
+        await message.reply_text("❌ Format: /delurl nom")
+
+print("🤖 Bot ishga tushdi!")
+app.run()
